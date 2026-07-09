@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  # Monoton API
+  api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - LEDGER_HOST=sandbox
+      - LEDGER_PORT=6865
+      - AUTH_ISSUER=http://localhost:9999
+      - AUTH_AUDIENCE=monoton-api
+      - CORS_ORIGIN=*
+      - PORT=3000
+      - LOG_LEVEL=debug
+    depends_on:
+      - sandbox
+    networks:
+      - monoton-net
+
+  # Canton Sandbox for local development
+  sandbox:
+    image: digitalasset/canton-sandbox:latest
+    ports:
+      - "6865:6865"
+    volumes:
+      - ./dars:/dars:ro
+    command: |
+      --port 6865
+      --dar /dars/monotron-main-0.0.1.dar
+    networks:
+      - monoton-net
+
+networks:
+  monoton-net:
+    driver: bridge

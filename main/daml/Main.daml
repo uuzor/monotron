@@ -36,6 +36,11 @@ import Splice.Api.Token.HoldingV1
   , InstrumentId(..)
   )
 
+import Splice.Api.Token.MetadataV1
+  ( Metadata(..)
+  , emptyMetadata
+  )
+
 -- =============================================================================
 -- INVOICE STATUS
 -- =============================================================================
@@ -338,3 +343,131 @@ template Invoice
       do
         assert (status == AwaitingSettlement)
         create this with status = Approved, transferInstructionCid = None
+
+-- =============================================================================
+-- WALLET / HOLDING CREATION (For Testing)
+-- =============================================================================
+-- This module provides a simple way to create Holding contracts for testing.
+-- In production, Holdings would be created via the Token Standard registry.
+--
+-- For Devnet testing, we provide:
+-- 1. TestHolding: A simple holding template for funding test accounts
+-- 2. Faucet: An operator-controlled minting contract for test tokens
+--
+-- IMPORTANT: In production:
+-- - Holdings are created via TransferFactory/Mint operations
+-- - This module is for TESTING ONLY
+
+-- | A simple test Holding that implements the Holding interface.
+-- This is used for testing the full settlement flow without requiring
+-- the full Token Standard implementation.
+--
+-- In production, real Holdings would be:
+-- - Created via TransferFactory_Transfer (transfers)
+-- - Minted via AllocationFactory (initial issuance)
+--
+-- This test holding allows us to:
+-- 1. Fund buyer accounts with test tokens
+-- 2. Test the full settlement flow end-to-end
+-- 3. Verify Invoice_ConfirmSettled security checks work
+--
+-- IMPORTANT: This implements the Token Standard Holding interface,
+-- so it can be used directly with Invoice_ConfirmSettled.
+
+template TestHolding
+  with
+    owner : Party           -- Who holds these tokens
+    instrumentAdmin : Party -- The admin who issued this token
+    currencyCode : Text     -- Currency identifier (e.g., "CC", "USD")
+    amount : Decimal        -- How many tokens
+  where
+    signatory owner, instrumentAdmin
+    observer instrumentAdmin
+
+    ensure amount > 0.0
+
+    -- Implement the Holding interface
+    interface instance Holding for TestHolding where
+      view = HoldingView with
+        owner = owner
+        instrumentId = InstrumentId with
+          admin = instrumentAdmin
+          id = currencyCode
+        amount = amount
+        lock = None
+        meta = emptyMetadata
+
+    -- Transfer the holding to another party
+    choice TestHolding_Transfer : (ContractId TestHolding, ContractId TestHolding)
+      with
+        newOwner : Party
+      controller owner
+      do
+        assert (newOwner /= owner)
+        oldHolding <- create this with owner = owner
+        newHolding <- create this with owner = newOwner
+        pure (oldHolding, newHolding)
+
+-- | A faucet for minting test tokens.
+-- The operator can create TestHolding contracts to fund test accounts.
+--
+-- In production, token minting would be controlled by:
+-- - AllocationFactory from utility-registry
+-- - Off-ledger API calls to the token registry
+template Faucet
+  with
+    operator : Party           -- Who can mint tokens
+    instrumentAdmin : Party     -- The admin for these tokens
+    currencyCode : Text          -- Currency to mint
+  where
+    signatory operator
+
+    -- Mint new tokens to a party
+    -- This simulates what AllocationFactory does in production
+    nonconsuming choice Faucet_Mint : ContractId TestHolding
+      with
+        recipient : Party        -- Who receives the tokens
+        amount : Decimal         -- How many to mint
+      controller operator
+      do
+        assert (amount > 0.0)
+        create TestHolding with
+          owner = recipient
+          instrumentAdmin = instrumentAdmin
+          currencyCode = currencyCode
+          amount = amount
+
+    -- Batch mint to multiple recipients
+    nonconsuming choice Faucet_BatchMint : [ContractId TestHolding]
+      with
+        recipients : [(Party, Decimal)]  -- (recipient, amount) pairs
+      controller operator
+      do
+        forA recipients $ \(recipient, amt) -> do
+          assert (amt > 0.0)
+          create TestHolding with
+            owner = recipient
+            instrumentAdmin = instrumentAdmin
+            currencyCode = currencyCode
+            amount = amt
+
+-- | Wallet service for a party.
+-- Provides convenience choices for managing holdings.
+template Wallet
+  with
+    owner : Party              -- The wallet owner
+    operator : Party            -- The platform operator
+  where
+    signatory owner
+    observer operator
+
+    -- Request tokens from faucet (off-ledger call would trigger this)
+    nonconsuming choice Wallet_RequestFaucet : ContractId TestHolding
+      with
+        faucetCid : ContractId Faucet
+        amount : Decimal
+      controller owner
+      do
+        exercise faucetCid Faucet_Mint with
+          recipient = owner
+          amount = amount
