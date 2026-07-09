@@ -6,8 +6,18 @@
 -- - Ride on Devnet Canton Coin (don't mint own instrument)
 -- - Path A settlement (single atomic batch call)
 -- - Privacy: Only stakeholders see contracts (signatory/observer model)
+--
+-- DATA-DEPENDENCIES (utility-registry packages v0.12.5):
+-- - utility-registry-v0-0.6.0.dar
+-- - utility-registry-holding-v0-0.2.1.dar
+-- - utility-registry-app-v0-0.7.0.dar
+-- - splice-api-token-transfer-instruction-v1-1.0.0.dar
+-- These provide the Token Standard interfaces (CIP-0056) for settlement.
 
 module Main where
+
+-- Import the Token Standard TransferInstruction interface (CIP-0056)
+import Splice.Api.Token.TransferInstructionV1 (TransferInstruction, TransferInstructionView)
 
 -- =============================================================================
 -- INVOICE STATUS
@@ -23,44 +33,24 @@ data InvoiceStatus
   deriving (Eq, Show)
 
 -- =============================================================================
--- TRANSFER INSTRUCTION (CIP-0056 Reference)
+-- SETTLEMENT INFRASTRUCTURE (CIP-0056 / Token Standard)
 -- =============================================================================
--- This is a STUB for the Canton Token Standard (CIP-0056) TransferInstruction.
--- We don't implement this - it's provided by the Canton Token Standard DAR.
--- See: https://github.com/canton-foundation/cips/blob/main/cip-0056/
+-- We use the Canton Token Standard (CIP-0056) interfaces from the utility-registry
+-- packages for settlement. These are the real interfaces, not stubs.
 --
--- For deployment to Canton Devnet:
--- 1. Add data-dependencies on the Canton Token Standard DAR
--- 2. Change Invoice_InitiateSettlement to use ContractId TransferInstruction
---    (the real interface from Canton Token Standard)
+-- Key interfaces used:
+-- - TransferInstruction: from Splice.Api.Token.TransferInstructionV1
+-- - TransferFactory: creates TransferInstruction contracts
+-- - TransferRule: executes transfers
 --
--- For local testing, we use a placeholder template that mirrors the interface.
+-- For Path A (atomic batch):
+-- The API layer submits TransferInstruction_Accept + Invoice_ConfirmSettled
+-- in a single Canton batch transaction.
 
-template TransferInstruction
-  with
-    sender : Party
-    receiver : Party
-    amount : Decimal
-    transferId : Text
-  where
-    signatory sender
-    observer receiver
-
-    -- Accept the transfer (receiver signs off)
-    choice TransferInstruction_Accept : ContractId TransferInstruction
-      controller receiver
-      do pure self
-
-    -- Reject the transfer
-    choice TransferInstruction_Reject : ContractId TransferInstruction
-      with reason : Text
-      controller receiver
-      do pure self
-
-    -- Withdraw/cancel the transfer
-    choice TransferInstruction_Withdraw : ContractId TransferInstruction
-      controller sender
-      do pure self
+-- | Transfer instruction interface from CIP-0056 / Token Standard.
+-- This is imported from Splice.Api.Token.TransferInstructionV1.
+-- The actual TransferInstruction contracts are created via TransferFactory
+-- and exercised via TransferInstruction_Accept/Reject/Withdraw choices.
 
 -- =============================================================================
 -- BUSINESS REGISTRATION (Onboarding)
@@ -245,6 +235,8 @@ template Invoice
       with
         -- Reference to the TransferInstruction contract (created via registry API)
         -- This links the invoice to the actual token transfer
+        -- The TransferInstruction interface is from Splice.Api.Token.TransferInstructionV1
+        -- (CIP-0056 Token Standard)
         transferInstructionCid : ContractId TransferInstruction
       controller buyer
       do
