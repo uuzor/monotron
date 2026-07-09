@@ -218,6 +218,7 @@ testInvoiceLifecycle = script do
       status = M.Created
       invoiceId = "INV-001"
       instrumentAdmin = instrumentAdmin
+      transferInstructionCid = None
 
   -- Buyer approves the invoice
   approvedInvoiceCid <- submit buyer do
@@ -255,6 +256,7 @@ testInvoiceRejection = script do
       status = M.Created
       invoiceId = "INV-002"
       instrumentAdmin = instrumentAdmin
+      transferInstructionCid = None
 
   rejectedInvoiceCid <- submit buyer do
     exerciseCmd invoiceCid Invoice_Reject
@@ -282,6 +284,7 @@ testSellerCannotApproveOwnInvoice = script do
       status = M.Created
       invoiceId = "INV-003"
       instrumentAdmin = instrumentAdmin
+      transferInstructionCid = None
 
   -- Seller tries to approve - should fail
   submitMustFail seller do
@@ -309,6 +312,7 @@ testCannotSettleBeforeInitiation = script do
       status = M.Created
       invoiceId = "INV-004"
       instrumentAdmin = instrumentAdmin
+      transferInstructionCid = None
 
   approvedInvoiceCid <- submit buyer do
     exerciseCmd invoiceCid Invoice_Approve
@@ -316,7 +320,7 @@ testCannotSettleBeforeInitiation = script do
   -- Operator tries to confirm settlement without initiation - should fail
   submitMustFail operator do
     exerciseCmd approvedInvoiceCid Invoice_ConfirmSettled
-      with settledTransferId = "TX-999"
+      with transferResult = None
 
   pure ()
 
@@ -340,6 +344,7 @@ testSettlementCancellation = script do
       status = M.Created
       invoiceId = "INV-005"
       instrumentAdmin = instrumentAdmin
+      transferInstructionCid = None
 
   approvedInvoiceCid <- submit buyer do
     exerciseCmd invoiceCid Invoice_Approve
@@ -377,7 +382,7 @@ testSettlementCancellation = script do
 --       "contractId": "<invoiceCid>",
 --       "choice": "Invoice_ConfirmSettled",
 --       "argument": {
---         "settledTransferId": "TX-123"
+--         "transferResult": null
 --       }
 --     }
 --   ],

@@ -1,8 +1,37 @@
 # Monoton: Full Protocol Flow Sketch
 
-**How money moves on Canton: Holdings, not accounts. Direct transfer, not escrow.**
+**How money moves on Canton: Holdings, not accounts. Two-phase transfer, no custodial escrow.**
 
 ---
+
+## IMPORTANT CORRECTION: There IS a Locked State
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              CORRECTION: The "No Escrow" Claim                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ❌ INCORRECT: "No locked state"                               │
+│     ─────────────────────────────                               │
+│     The TransferInstruction IS a locked, in-between state.         │
+│     When TransferFactory_Transfer is called:                     │
+│     1. Buyer's input Holding(s) are CONSUMED (archived)        │
+│     2. Value sits INSIDE the pending TransferInstruction         │
+│     3. Value is locked until Accept/Reject/Withdraw             │
+│                                                                  │
+│  ✅ CORRECT: "No custodial escrow"                              │
+│     ─────────────────────────────────                           │
+│     No third party holds the funds.                              │
+│     The TransferInstruction contract itself enforces the         │
+│     two-phase commit. No admin can seize or redirect.          │
+│                                                                  │
+│  DIFFERENCE MATTERS:                                            │
+│  "No custodial escrow" = True and is the differentiator         │
+│  "No locked state"    = False, and someone technical            │
+│                          will catch it in Q&A                     │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ## Core Concept: On-Canton "Money" Is Different
 
@@ -17,25 +46,46 @@
 │    │ balance │   hold   │   holds     │ release  │ balance │   │
 │    └─────────┘   funds   │   funds     │          └─────────┘   │
 │                                                                  │
-│    Bank intermediates. Money sits in escrow.                     │
+│    Bank intermediates. Third party holds funds.                 │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
-│            Canton Token Standard (Holding Model)                    │
+│            Canton Token Standard (Two-Phase Transfer)                 │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
-│    ┌─────────────────┐              ┌─────────────────┐            │
-│    │ Holding (UTXO) │  ─────────► │ Holding (UTXO) │            │
-│    │                 │   transfer   │                 │            │
-│    │ owner: Buyer    │  (atomic)   │ owner: Seller  │            │
-│    │ amount: 1000    │              │ amount: 1000    │            │
-│    │ instrument: CC  │              │ instrument: CC  │            │
-│    └─────────────────┘              └─────────────────┘            │
-│           BEFORE                          AFTER                   │
+│  PHASE 1: Create TransferInstruction                            │
+│  ─────────────────────────────────────────────                  │
+│  ┌─────────────────┐                                           │
+│  │  TransferInstruction │ ← VALUE LOCKED HERE                   │
+│  │  (pending)         │   Buyer's Holding(s) consumed          │
+│  │                     │   Value held by contract               │
+│  │  sender: Buyer    │                                       │
+│  │  receiver: Seller │   No third party can access            │
+│  │  amount: 1000    │   Contract enforces two-phase           │
+│  │  status: Pending │                                       │
+│  └─────────────────┘                                           │
 │                                                                  │
-│    No escrow. No intermediate contract holding funds.            │
-│    Money = contract ownership. Transfer = contract movement.       │
+│  PHASE 2: Accept → Resolve                                     │
+│  ──────────────────────────                                      │
+│                                                                  │
+│  ACCEPT:                                                         │
+│  ┌─────────────────┐    ┌─────────────────┐                     │
+│  │ TransferInstruction │──►│ NEW Holding    │                     │
+│  │ (archived)         │    │ owner: Seller │                     │
+│  │                    │    │ amount: 1000 │                     │
+│  │                    │    └─────────────────┘                     │
+│  └─────────────────┘                                           │
+│                                                                  │
+│  REJECT/WITHDRAW:                                               │
+│  ┌─────────────────┐    ┌─────────────────┐                     │
+│  │ TransferInstruction │──►│ ORIGINAL HOLDING│                   │
+│  │ (archived)         │    │ returns to     │                   │
+│  │                    │    │ buyer          │                   │
+│  └─────────────────┘    └─────────────────┘                     │
+│                                                                  │
+│  KEY: No third party custodies funds.                           │
+│       The instruction contract itself enforces escrow.            │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -281,62 +331,115 @@
 
 ---
 
-## Phase 4: Detailed Settlement Transaction
+## Phase 4: Detailed Settlement Transaction (CORRECTED)
+
+**KEY CORRECTION**: The TransferInstruction IS a locked state. It's not "no locked state" - it's "no custodial escrow."
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│              PATH A BATCH TRANSACTION (The Actual Commands)            │
+│     PATH A BATCH: Two-Phase Transfer in One Atomic Transaction       │
 ├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  In Path A, all steps execute in ONE Canton transaction.          │
+│  The TransferInstruction exists only WITHIN this transaction.      │
+│  No "pending" state persists between transactions.               │
 │                                                                  │
 │  API Call: POST /v2/commands/submit-and-wait                     │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │  {                                                       │    │
 │  │    "commands": [                                         │    │
 │  │                                                           │    │
-│  │      // Step 1: Buyer creates TransferInstruction        │    │
+│  │      // STEP 1: TransferFactory_Transfer                  │    │
+│  │      // Consumes Buyer's input Holding(s)                 │    │
+│  │      // Value now LOCKED inside pending TransferInstruction │    │
 │  │      {                                                    │    │
-│  │        "commandType": "create",                          │    │
 │  │        "templateId": "TransferFactory:...",               │    │
+│  │        "choice": "TransferFactory_Transfer",               │    │
 │  │        "argument": {                                     │    │
 │  │          "transfer": {                                    │    │
-│  │            "sender": "BobCo::participant1",              │    │
-│  │            "receiver": "AliceCorp::participant1",      │    │
-│  │            "amount": 1000.00,                            │    │
-│  │            "instrumentId": { "id": "CC", ... }           │    │
+│  │            "sender": "BobCo",                             │    │
+│  │            "receiver": "AliceCorp",                      │    │
+│  │            "amount": 1000.00,                           │    │
+│  │            "instrumentId": { "id": "CC", ... },          │    │
+│  │            "inputHoldingCids": ["Holding:abc123"]         │    │
 │  │          }                                                │    │
 │  │        }                                                  │    │
 │  │      },                                                    │    │
 │  │                                                           │    │
-│  │      // Step 2: Accept the transfer (moves Holdings)     │    │
+│  │      // STEP 2: TransferInstruction_Accept                │    │
+│  │      // Archives pending instruction, mints new Holding    │    │
 │  │      {                                                    │    │
-│  │        "commandType": "exercise",                        │    │
-│  │        "templateId": "TransferInstruction:...",          │    │
+│  │        "templateId": "TransferInstruction:...",            │    │
 │  │        "choice": "TransferInstruction_Accept"             │    │
 │  │      },                                                    │    │
 │  │                                                           │    │
-│  │      // Step 3: Mark invoice as settled                   │    │
+│  │      // STEP 3: Invoice_ConfirmSettled                     │    │
 │  │      {                                                    │    │
-│  │        "commandType": "exercise",                        │    │
 │  │        "templateId": "Invoice:...",                       │    │
-│  │        "choice": "Invoice_ConfirmSettled",                │    │
-│  │        "argument": { "settledTransferId": "TX-123" }     │    │
+│  │        "choice": "Invoice_ConfirmSettled"                 │    │
 │  │      }                                                     │    │
 │  │    ],                                                      │    │
-│  │    "actAs": ["BobCo", "Monoton::participant1"]           │    │
+│  │    "actAs": ["BobCo", "Monoton"]                          │    │
 │  │  }                                                         │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │                                                                  │
-│  WHAT HAPPENS ON THE LEDGER:                                    │
+│  LEDGER EFFECTS (atomic, all-or-nothing):                      │
 │                                                                  │
-│  1. TransferInstruction created (pending)                        │
-│  2. TransferInstruction_Accept exercised:                        │
-│     - Archives: BobCo's Holding(10000 CC)                      │
-│     - Creates: BobCo's Holding(9000 CC) - change               │
-│     - Creates: AliceCorp's Holding(6000 CC) - received        │
-│  3. Invoice status → Settled                                    │
+│  1. TransferFactory_Transfer:                                     │
+│     - CONSUMES: BobCo's Holding(10000 CC) ← ARCHIVED           │
+│     - CREATES: TransferInstruction(pending, holds 1000 CC)    │
 │                                                                  │
-│  ATOMICITY: All 3 steps succeed or all 3 fail.                 │
-│  No state where Bob paid but Alice didn't receive.             │
+│  2. TransferInstruction_Accept:                                    │
+│     - CONSUMES: TransferInstruction(pending) ← ARCHIVED          │
+│     - CREATES: AliceCorp's Holding(6000 CC) ← RECEIVED         │
+│     - CREATES: BobCo's Holding(9000 CC) ← CHANGE (if any)     │
+│                                                                  │
+│  3. Invoice status → Settled                                     │
+│                                                                  │
+│  The "pending" state exists ONLY within this transaction.        │
+│  No intermediate state visible between transactions.              │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Phase 5: Path A Only - No "Learning" Step Needed
+
+**DECISION**: Hackathon uses Path A only, no Path B fallback.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│              WHY PATH A ONLY SIMPLIFIES INVOICE                       │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  PATH A (used):                                                 │
+│  ───────────────────────────────────────────────────────────    │
+│  API constructs ALL commands in one batch:                       │
+│    1. TransferFactory_Transfer                                  │
+│    2. TransferInstruction_Accept                                 │
+│    3. Invoice_ConfirmSettled                                     │
+│                                                                  │
+│  These execute as ONE Canton transaction.                        │
+│                                                                  │
+│  Invoice_ConfirmSettled doesn't need to "learn" anything       │
+│  because it executes in the SAME transaction as the transfer.    │
+│                                                                  │
+│  The ledger guarantees:                                         │
+│    If Invoice shows Settled → Transfer definitely completed        │
+│    If Transfer completed → Invoice definitely shows Settled        │
+│                                                                  │
+│  ────────────────────────────────────────────────────────────   │
+│                                                                  │
+│  PATH B (NOT used):                                             │
+│  ──────────────────────────────────────────────────────────     │
+│  If accept happened separately, Invoice needs to learn:          │
+│    - Matching service watches transaction stream                  │
+│    - On TransferInstruction_Accept event:                        │
+│    - Submit Invoice_ConfirmSettled separately                    │
+│    - NOT atomic with transfer                                    │
+│                                                                  │
+│  This is why Path A is preferred - true atomicity.              │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -449,7 +552,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    KEY INSIGHTS                                      │
+│                    KEY INSIGHTS (CORRECTED)                            │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │  1. INVOICE IS NOT A SMART CONTRACT HOLDING MONEY               │
@@ -458,28 +561,44 @@
 │     • It references the transfer, not holds funds              │
 │     • Actual money lives in Holding contracts                     │
 │                                                                  │
-│  2. MONEY MOVES DIRECTLY, NOT THROUGH ESCROW                   │
+│  2. THERE IS A LOCKED STATE - BUT NO CUSTODIAL ESCROW         │
 │     ─────────────────────────────────────────────────────       │
-│     • Before: Buyer Holding(10000) → Seller Holding(5000)       │
-│     • After:  Buyer Holding(9000)  → Seller Holding(6000)      │
-│     • No intermediate contract holding funds                     │
+│     • TransferInstruction DOES hold value temporarily            │
+│     • But it's enforced by CODE, not a third party             │
+│     • No admin can seize or redirect funds inside it            │
+│     • ACCEPT → seller receives, REJECT/WITHDRAW → buyer gets back │
 │                                                                  │
-│  3. HOLDINGS ARE THE MONEY                                       │
+│  3. "NO CUSTODIAL ESCROW" IS THE DIFFERENTIATOR               │
+│     ─────────────────────────────────────────────────────       │
+│     • Not "no locked state" (that would be false)              │
+│     • Not "no intermediary" (TransferInstruction IS intermediary) │
+│     • DIFFERENT: No third party can touch your money             │
+│     • The contract enforces escrow, not a company                 │
+│                                                                  │
+│  4. HOLDINGS ARE THE MONEY                                       │
 │     ─────────────────────────────────────────────────────       │
 │     • Not a database record of balance                           │
 │     • Not an account with a number                              │
 │     • A CONTRACT you own = tokens you have                      │
 │     • Transfer = contract ownership change                        │
 │                                                                  │
-│  4. SETTLEMENT IS ATOMIC                                         │
+│  5. SETTLEMENT IS ATOMIC (Path A)                              │
 │     ─────────────────────────────────────────────────────       │
 │     • One Canton transaction moves money AND updates invoice     │
 │     • No partial states                                          │
 │     • If any step fails, entire transaction rolls back           │
+│     • Pending state exists only WITHIN the transaction            │
 │                                                                  │
-│  5. FUNDING = GETTING HOLDINGS                                   │
+│  6. PATH A ONLY - NO "LEARNING" NEEDED                         │
 │     ─────────────────────────────────────────────────────       │
-│     • Devnet: Faucet gives you test Holdings                    │
+│     • API constructs all commands in one batch                   │
+│     • Transfer + Accept + ConfirmSettled are atomic              │
+│     • Invoice doesn't need to "learn" about transfer result      │
+│     • Ledger guarantees: Settled = Transfer completed            │
+│                                                                  │
+│  7. FUNDING = GETTING HOLDINGS                                   │
+│     ─────────────────────────────────────────────────────       │
+│     • Devnet: Faucet gives you test Holdings                   │
 │     • Production: Bank transfer → Monoton mints Holdings         │
 │     • (Or: Existing business sends you Holdings)                │
 │                                                                  │

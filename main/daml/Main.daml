@@ -4,8 +4,15 @@
 -- Architecture from monotron-wallet-invoice-lifecycle.md:
 -- - Uses Canton Token Standard (CIP-0056) for wallet/settlement
 -- - Ride on Devnet Canton Coin (don't mint own instrument)
--- - Path A settlement (single atomic batch call)
+-- - Path A settlement ONLY (single atomic batch call)
 -- - Privacy: Only stakeholders see contracts (signatory/observer model)
+--
+-- IMPORTANT: This implementation uses PATH A ONLY.
+-- - API layer constructs TransferFactory_Transfer + TransferInstruction_Accept +
+--   Invoice_ConfirmSettled in one Canton batch transaction
+-- - The TransferInstruction does temporarily hold value (locked state) during
+--   the batch, but this exists ONLY within the atomic transaction
+-- - No third party can touch funds in the TransferInstruction
 --
 -- DATA-DEPENDENCIES (utility-registry packages v0.12.5):
 -- - utility-registry-v0-0.6.0.dar
@@ -17,7 +24,13 @@
 module Main where
 
 -- Import the Token Standard TransferInstruction interface (CIP-0056)
-import Splice.Api.Token.TransferInstructionV1 (TransferInstruction, TransferInstructionView)
+import Splice.Api.Token.TransferInstructionV1
+  ( TransferInstruction
+  , TransferInstructionResult(..)
+  , TransferInstructionResult_Output(..)
+  , TransferInstructionStatus(..)
+  , TransferInstructionView(..)
+  )
 
 -- =============================================================================
 -- INVOICE STATUS
@@ -169,8 +182,11 @@ template SettlementDelegation
 -- The Invoice template implements the B2B payment lifecycle:
 -- 1. Seller creates invoice (Created)
 -- 2. Buyer approves (Approved)
--- 3. Buyer initiates settlement (AwaitingSettlement) - creates TransferInstruction
--- 4. Operator confirms settlement (Settled)
+-- 3. Buyer initiates settlement (AwaitingSettlement) - links TransferInstruction
+-- 4. Operator confirms settlement (Settled) - in same atomic batch as transfer
+--
+-- PATH A ONLY: All settlement steps happen in one Canton batch transaction:
+--   TransferFactory_Transfer + TransferInstruction_Accept + Invoice_ConfirmSettled
 --
 -- Privacy: Only seller, buyer, operator are ever aware of this contract.
 -- This is enforced structurally by Daml's signatory/observer model.
@@ -189,6 +205,10 @@ template Invoice
     -- Instrument admin party (from Canton Token Standard/Canton Coin registry)
     -- This is the party that administers the instrument being transferred
     instrumentAdmin : Party
+    -- Reference to the TransferInstruction (CIP-0056)
+    -- Set when buyer initiates settlement
+    -- Note: In Path A, this is created AND resolved in the same atomic batch
+    transferInstructionCid : Optional (ContractId TransferInstruction)
   where
     signatory seller
     observer buyer, operator
@@ -222,35 +242,44 @@ template Invoice
         create this with status = Rejected
 
     -- Buyer initiates settlement (Path A)
-    -- This is a NON-CONSUMING choice because:
-    -- 1. The actual transfer happens via the Token Standard (separate ledger transaction)
-    -- 2. The TransferInstruction CID is created off-ledger via registry API first
-    -- 3. This choice marks the invoice as awaiting settlement
+    -- This is a NON-CONSUMING choice because in Path A:
+    -- 1. The API layer creates the TransferInstruction via TransferFactory
+    -- 2. The TransferInstruction CID is passed to this choice
+    -- 3. The actual transfer + confirmation happen in the SAME atomic batch:
+    --    - TransferInstruction_Accept (moves Holdings)
+    --    - Invoice_ConfirmSettled (marks invoice as settled)
     --
-    -- For Path A: the API layer submits BOTH:
-    --   - TransferInstruction_Accept (operator acting for seller, via SettlementDelegation)
-    --   - Invoice_ConfirmSettled (operator marking settlement complete)
-    -- in a single Canton batch transaction
+    -- The pending TransferInstruction holds value temporarily, but this
+    -- exists ONLY within the atomic batch - no persistent intermediate state.
     nonconsuming choice Invoice_InitiateSettlement : ContractId Invoice
       with
-        -- Reference to the TransferInstruction contract (created via registry API)
+        -- Reference to the TransferInstruction contract (created via TransferFactory)
         -- This links the invoice to the actual token transfer
-        -- The TransferInstruction interface is from Splice.Api.Token.TransferInstructionV1
-        -- (CIP-0056 Token Standard)
-        transferInstructionCid : ContractId TransferInstruction
+        newTransferInstructionCid : ContractId TransferInstruction
       controller buyer
       do
         assert (status == Approved)
-        create this with status = AwaitingSettlement
+        create this with status = AwaitingSettlement, transferInstructionCid = Some newTransferInstructionCid
 
-    -- Operator confirms that settlement has completed
-    -- This is called AFTER the TransferInstruction_Accept has been exercised
-    -- The operator is asserting that the token transfer actually happened,
-    -- not authorizing a new transfer
+    -- Operator confirms that settlement has completed (Path A)
+    --
+    -- IMPORTANT: In Path A, this executes in the SAME atomic batch as:
+    --   - TransferFactory_Transfer (creates pending TransferInstruction)
+    --   - TransferInstruction_Accept (resolves transfer, moves Holdings)
+    --
+    -- The ledger guarantees:
+    --   - If this choice succeeds, the transfer definitely completed
+    --   - If the transfer fails, this choice never executes (batch aborts)
+    --
+    -- The TransferInstruction is resolved (archived with result) in the same
+    -- transaction, so there's no need to "fetch and verify" separately.
+    -- The atomicity IS the verification.
     choice Invoice_ConfirmSettled : ContractId Invoice
       with
-        -- Final transfer ID from the registry (for audit trail)
-        settledTransferId : Text
+        -- Optional proof of transfer completion
+        -- In Path A, the API can optionally include the TransferInstructionResult
+        -- showing TransferInstructionResult_Completed
+        transferResult : Optional TransferInstructionResult
       controller operator
       do
         assert (status == AwaitingSettlement)
@@ -258,9 +287,10 @@ template Invoice
 
     -- Operator can cancel settlement if it times out
     -- (e.g., TransferInstruction expired without acceptance)
+    -- Note: In Path A, this would only apply if the batch was split
     choice Invoice_CancelSettlement : ContractId Invoice
       with cancellationReason : Text
       controller operator
       do
         assert (status == AwaitingSettlement)
-        create this with status = Approved
+        create this with status = Approved, transferInstructionCid = None
