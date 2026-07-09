@@ -23,13 +23,17 @@
 
 module Main where
 
--- Import the Token Standard TransferInstruction interface (CIP-0056)
+-- Import the Token Standard interfaces (CIP-0056)
 import Splice.Api.Token.TransferInstructionV1
   ( TransferInstruction
   , TransferInstructionResult(..)
   , TransferInstructionResult_Output(..)
-  , TransferInstructionStatus(..)
-  , TransferInstructionView(..)
+  )
+
+import Splice.Api.Token.HoldingV1
+  ( Holding
+  , HoldingView(..)
+  , InstrumentId(..)
   )
 
 -- =============================================================================
@@ -267,22 +271,62 @@ template Invoice
     --   - TransferFactory_Transfer (creates pending TransferInstruction)
     --   - TransferInstruction_Accept (resolves transfer, moves Holdings)
     --
-    -- The ledger guarantees:
-    --   - If this choice succeeds, the transfer definitely completed
-    --   - If the transfer fails, this choice never executes (batch aborts)
+    -- SECURITY: This choice MUST verify the transfer actually completed with
+    -- correct values. Without verification, operator could batch a fake $1
+    -- transfer with Invoice_ConfirmSettled for a $10,000 invoice.
     --
-    -- The TransferInstruction is resolved (archived with result) in the same
-    -- transaction, so there's no need to "fetch and verify" separately.
-    -- The atomicity IS the verification.
+    -- The Holding interface alone doesn't guarantee legitimacy (anyone can
+    -- implement the interface with false data). The check against
+    -- instrumentAdmin is what proves the Holding came from the real instrument.
+    --
+    -- TransferInstructionResult_Accept is NOT guaranteed to return Completed -
+    -- implementations MAY return any of the three result types.
     choice Invoice_ConfirmSettled : ContractId Invoice
       with
-        -- Optional proof of transfer completion
-        -- In Path A, the API can optionally include the TransferInstructionResult
-        -- showing TransferInstructionResult_Completed
-        transferResult : Optional TransferInstructionResult
+        -- The seller's new Holding from the completed transfer
+        -- This is returned by TransferInstruction_Accept in TransferInstructionResult_Completed
+        settledHoldingCid : ContractId Holding
+        -- The result of the TransferInstruction_Accept choice
+        -- Used to verify the transfer actually succeeded
+        transferResult : TransferInstructionResult
       controller operator
       do
         assert (status == AwaitingSettlement)
+        
+        -- Verify the transfer completed successfully
+        -- Per Token Standard docs, Accept may return Pending/Completed/Failed
+        -- We only settle if it actually completed
+        case transferResult.output of
+          TransferInstructionResult_Failed ->
+            -- Transfer failed - cannot settle
+            abort "Transfer instruction failed"
+          TransferInstructionResult_Pending _ ->
+            -- Transfer still pending - cannot settle
+            abort "Transfer instruction still pending"
+          TransferInstructionResult_Completed with receiverHoldingCids ->
+            -- Transfer completed - verify the Holding
+            -- The completed transfer should have created Holdings for the seller
+            -- We check that our provided holding is among them
+            assert (settledHoldingCid `elem` receiverHoldingCids)
+        
+        -- SECURITY: Fetch the Holding and verify it actually represents the settlement
+        -- This is critical because Holding is an interface - anyone can implement
+        -- it with false data. The instrumentAdmin check proves legitimacy.
+        holdingContract <- fetch settledHoldingCid
+        let holdingView = view holdingContract
+        
+        -- Verify the Holding belongs to the seller (not someone else)
+        assert (holdingView.owner == seller)
+        
+        -- Verify the Holding has the correct amount
+        assert (holdingView.amount == amount)
+        
+        -- SECURITY CRITICAL: Verify the Holding's instrument is administered by
+        -- the expected instrumentAdmin. Without this check, someone could provide
+        -- a fake Holding claiming to be from the right instrument with the right amount.
+        -- The instrumentAdmin field on Invoice is load-bearing - it's what enables this check.
+        assert (holdingView.instrumentId.admin == instrumentAdmin)
+        
         create this with status = Settled
 
     -- Operator can cancel settlement if it times out
