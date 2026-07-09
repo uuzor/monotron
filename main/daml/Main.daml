@@ -1,0 +1,97 @@
+-- Monoton: B2B Invoice Settlement with Privacy-Preserving Agentic Commerce
+-- Built for Build on Canton Hackathon
+--
+-- Design decisions from monotron-wallet-invoice-lifecycle.md:
+-- - Signatory: seller (only seller can create invoices)
+-- - Observers: buyer, operator (Monoton platform)
+-- - Privacy: Only stakeholders can see the contract
+-- - Settlement: Uses Canton Token Standard (CIP-0056) for atomic transfers
+
+module Main where
+
+-- | Invoice status throughout its lifecycle
+data InvoiceStatus
+  = Created          -- Invoice created by seller, awaiting buyer approval
+  | Approved         -- Buyer approved the invoice
+  | AwaitingSettlement  -- Settlement transfer initiated
+  | Settled          -- Funds have been transferred
+  | Rejected         -- Buyer rejected the invoice
+  deriving (Eq, Show)
+
+-- | Generate a unique invoice ID
+template Invoice
+  with
+    seller          : Party       -- The business issuing the invoice (signatory)
+    buyer           : Party       -- The business that will pay (observer)
+    operator        : Party       -- Monoton platform operator (observer)
+    amount          : Decimal      -- Payment amount
+    currency        : Text        -- Currency code (e.g., "USD")
+    description     : Text        -- Invoice description
+    dueDate         : Date        -- Payment deadline
+    status          : InvoiceStatus
+    invoiceId       : Text        -- Unique identifier for the invoice
+  where
+    -- Seller is the sole signatory - only they can create invoices
+    signatory seller
+    
+    -- Buyer and operator are observers - they can see but not unilaterally modify
+    observer buyer
+    observer operator
+
+    -- Ensure valid business rules
+    ensure amount > 0.0
+         && seller /= buyer       -- Seller and buyer must be different parties
+         && seller /= operator    -- Seller and operator must be different
+
+    -- Seller updates description while invoice is in Created status
+    choice Invoice_UpdateDescription : ContractId Invoice
+      with newDescription : Text
+      controller seller
+      do
+        assert (status == Created)
+        create this with description = newDescription
+
+    -- Buyer approves the invoice
+    choice Invoice_Approve : ContractId Invoice
+      controller buyer
+      do
+        assert (status == Created)
+        create this with status = Approved
+
+    -- Buyer rejects the invoice
+    choice Invoice_Reject : ContractId Invoice
+      with rejectionReason : Text
+      controller buyer
+      do
+        assert (status == Created)
+        create this with status = Rejected
+
+    -- Buyer initiates settlement (Path A: atomic batch settlement)
+    -- This is a non-consuming choice to allow the API to orchestrate the transfer
+    nonconsuming choice Invoice_InitiateSettlement : ContractId Invoice
+      with
+        -- Transfer reference for tracking (filled by API layer)
+        transferReference : Text
+      controller buyer
+      do
+        assert (status == Approved)
+        create this with status = AwaitingSettlement
+
+    -- Operator confirms that settlement has completed
+    -- Controller is operator because they're verifying the token transfer occurred
+    choice Invoice_ConfirmSettled : ContractId Invoice
+      with
+        -- Final transfer confirmation from the token registry
+        settledTransferId : Text
+      controller operator
+      do
+        assert (status == AwaitingSettlement)
+        create this with status = Settled
+
+    -- Operator can cancel if settlement times out and revert to Approved
+    choice Invoice_CancelSettlement : ContractId Invoice
+      with cancellationReason : Text
+      controller operator
+      do
+        assert (status == AwaitingSettlement)
+        create this with status = Approved

@@ -1,0 +1,146 @@
+-- Monoton Invoice Lifecycle Tests
+-- Tests the B2B invoice lifecycle from creation to settlement
+
+module Test where
+
+import Main
+import DA.Date
+import Daml.Script
+
+-- Use qualified names for Main module to avoid conflict with Daml.Script.Created
+import qualified Main as M
+
+-- | Test the full invoice lifecycle:
+-- 1. Seller creates invoice
+-- 2. Buyer approves
+-- 3. Buyer initiates settlement
+-- 4. Operator confirms settlement
+testInvoiceLifecycle : Script (ContractId Invoice)
+testInvoiceLifecycle = script do
+  -- Allocate parties
+  seller <- allocatePartyByHint (PartyIdHint "Seller")
+  buyer <- allocatePartyByHint (PartyIdHint "Buyer")
+  operator <- allocatePartyByHint (PartyIdHint "Operator")
+
+  -- Create users
+  sellerId <- validateUserId "seller"
+  buyerId <- validateUserId "buyer"
+  operatorId <- validateUserId "operator"
+  createUser (User sellerId (Some seller)) [CanActAs seller]
+  createUser (User buyerId (Some buyer)) [CanActAs buyer]
+  createUser (User operatorId (Some operator)) [CanActAs operator]
+
+  -- Seller creates an invoice
+  invoiceCid <- submit seller do
+    createCmd Invoice with
+      seller = seller
+      buyer = buyer
+      operator = operator
+      amount = 1000.00
+      currency = "USD"
+      description = "Consulting services for Q1 2025"
+      dueDate = date 2025 Mar 31
+      status = M.Created
+      invoiceId = "INV-001"
+
+  -- Buyer approves the invoice
+  approvedInvoiceCid <- submit buyer do
+    exerciseCmd invoiceCid Invoice_Approve
+
+  -- Buyer initiates settlement
+  settlementInvoiceCid <- submit buyer do
+    exerciseCmd approvedInvoiceCid Invoice_InitiateSettlement
+      with transferReference = "TX-12345"
+
+  -- Operator confirms settlement
+  settledInvoiceCid <- submit operator do
+    exerciseCmd settlementInvoiceCid Invoice_ConfirmSettled
+      with settledTransferId = "TX-12345-FINAL"
+
+  pure settledInvoiceCid
+
+-- | Test invoice rejection
+testInvoiceRejection : Script (ContractId Invoice)
+testInvoiceRejection = script do
+  -- Allocate parties
+  seller <- allocatePartyByHint (PartyIdHint "Seller2")
+  buyer <- allocatePartyByHint (PartyIdHint "Buyer2")
+  operator <- allocatePartyByHint (PartyIdHint "Operator2")
+
+  -- Seller creates an invoice
+  invoiceCid <- submit seller do
+    createCmd Invoice with
+      seller = seller
+      buyer = buyer
+      operator = operator
+      amount = 500.00
+      currency = "EUR"
+      description = "Software license"
+      dueDate = date 2025 Jun 30
+      status = M.Created
+      invoiceId = "INV-002"
+
+  -- Buyer rejects the invoice
+  rejectedInvoiceCid <- submit buyer do
+    exerciseCmd invoiceCid Invoice_Reject
+      with rejectionReason = "Price too high"
+
+  pure rejectedInvoiceCid
+
+-- | Test that seller cannot approve their own invoice
+testSellerCannotApproveOwnInvoice : Script ()
+testSellerCannotApproveOwnInvoice = script do
+  -- Allocate parties
+  seller <- allocatePartyByHint (PartyIdHint "Seller3")
+  buyer <- allocatePartyByHint (PartyIdHint "Buyer3")
+  operator <- allocatePartyByHint (PartyIdHint "Operator3")
+
+  -- Seller creates an invoice
+  invoiceCid <- submit seller do
+    createCmd Invoice with
+      seller = seller
+      buyer = buyer
+      operator = operator
+      amount = 250.00
+      currency = "GBP"
+      description = "Design work"
+      dueDate = date 2025 Apr 15
+      status = M.Created
+      invoiceId = "INV-003"
+
+  -- Seller tries to approve - should fail
+  submitMustFail seller do
+    exerciseCmd invoiceCid Invoice_Approve
+
+  pure ()
+
+-- | Test that operator cannot confirm settlement before initiation
+testCannotSettleBeforeInitiation : Script ()
+testCannotSettleBeforeInitiation = script do
+  -- Allocate parties
+  seller <- allocatePartyByHint (PartyIdHint "Seller4")
+  buyer <- allocatePartyByHint (PartyIdHint "Buyer4")
+  operator <- allocatePartyByHint (PartyIdHint "Operator4")
+
+  -- Seller creates and buyer approves
+  invoiceCid <- submit seller do
+    createCmd Invoice with
+      seller = seller
+      buyer = buyer
+      operator = operator
+      amount = 750.00
+      currency = "USD"
+      description = "Marketing services"
+      dueDate = date 2025 May 1
+      status = M.Created
+      invoiceId = "INV-004"
+
+  approvedInvoiceCid <- submit buyer do
+    exerciseCmd invoiceCid Invoice_Approve
+
+  -- Operator tries to confirm settlement without initiation - should fail
+  submitMustFail operator do
+    exerciseCmd approvedInvoiceCid Invoice_ConfirmSettled
+      with settledTransferId = "TX-999"
+
+  pure ()
