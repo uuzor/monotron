@@ -2,8 +2,13 @@
 """
 Monotron Devnet Client - Interacts with Canton Devnet JSON API
 Based on cn-quickstart splice-onboarding utils.sh
+
+Usage:
+    export DEVNET_CLIENT_SECRET="your-secret"
+    python3 scripts/devnet_client.py
 """
 import json
+import os
 import requests
 import time
 from typing import Optional, Dict, Any, List
@@ -12,8 +17,15 @@ from typing import Optional, Dict, Any, List
 LEDGER_HOST = "ledger-api.validator.devnet.sandbox.fivenorth.io"
 AUTH_URL = "https://auth.sandbox.fivenorth.io"
 CLIENT_ID = "validator-devnet-m2m"
-CLIENT_SECRET = "r69FQmevLRwEgMB8NnKaSDHPewTOSx7Yy5jucsqAlmsAaJc3DlggedCz4tyyonl4W2WoOVzkUIjy8dHTlc16AOJQzx02QzJylAUG56oLTCoVCJUUK40vRv9CqQEY3fjn"
+# Get secret from environment variable (set DEVNET_CLIENT_SECRET)
+CLIENT_SECRET = os.environ.get("DEVNET_CLIENT_SECRET", "")
 AUDIENCE = "validator-devnet-m2m"
+
+# Validate secret is set
+if not CLIENT_SECRET:
+    print("[ERROR] DEVNET_CLIENT_SECRET environment variable not set!")
+    print("Run: export DEVNET_CLIENT_SECRET='your-secret'")
+    exit(1)
 
 class DevnetClient:
     def __init__(self):
