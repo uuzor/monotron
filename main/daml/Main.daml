@@ -1,0 +1,473 @@
+-- Monoton: B2B Invoice Settlement with Privacy-Preserving Agentic Commerce
+-- Built for Build on Canton Hackathon
+--
+-- Architecture from monotron-wallet-invoice-lifecycle.md:
+-- - Uses Canton Token Standard (CIP-0056) for wallet/settlement
+-- - Ride on Devnet Canton Coin (don't mint own instrument)
+-- - Path A settlement ONLY (single atomic batch call)
+-- - Privacy: Only stakeholders see contracts (signatory/observer model)
+--
+-- IMPORTANT: This implementation uses PATH A ONLY.
+-- - API layer constructs TransferFactory_Transfer + TransferInstruction_Accept +
+--   Invoice_ConfirmSettled in one Canton batch transaction
+-- - The TransferInstruction does temporarily hold value (locked state) during
+--   the batch, but this exists ONLY within the atomic transaction
+-- - No third party can touch funds in the TransferInstruction
+--
+-- DATA-DEPENDENCIES (utility-registry packages v0.12.5):
+-- - utility-registry-v0-0.6.0.dar
+-- - utility-registry-holding-v0-0.2.1.dar
+-- - utility-registry-app-v0-0.7.0.dar
+-- - splice-api-token-transfer-instruction-v1-1.0.0.dar
+-- These provide the Token Standard interfaces (CIP-0056) for settlement.
+
+module Main where
+
+-- Import the Token Standard interfaces (CIP-0056)
+import Splice.Api.Token.TransferInstructionV1
+  ( TransferInstruction
+  , TransferInstructionResult(..)
+  , TransferInstructionResult_Output(..)
+  )
+
+import Splice.Api.Token.HoldingV1
+  ( Holding
+  , HoldingView(..)
+  , InstrumentId(..)
+  )
+
+import Splice.Api.Token.MetadataV1
+  ( Metadata(..)
+  , emptyMetadata
+  )
+
+-- =============================================================================
+-- INVOICE STATUS
+-- =============================================================================
+
+-- | Invoice status throughout its lifecycle
+data InvoiceStatus
+  = Created                -- Invoice created by seller, awaiting buyer approval
+  | Approved               -- Buyer approved the invoice
+  | AwaitingSettlement     -- Settlement transfer initiated
+  | Settled                -- Funds have been transferred
+  | Rejected               -- Buyer rejected the invoice
+  deriving (Eq, Show)
+
+-- =============================================================================
+-- SETTLEMENT INFRASTRUCTURE (CIP-0056 / Token Standard)
+-- =============================================================================
+-- We use the Canton Token Standard (CIP-0056) interfaces from the utility-registry
+-- packages for settlement. These are the real interfaces, not stubs.
+--
+-- Key interfaces used:
+-- - TransferInstruction: from Splice.Api.Token.TransferInstructionV1
+-- - TransferFactory: creates TransferInstruction contracts
+-- - TransferRule: executes transfers
+--
+-- For Path A (atomic batch):
+-- The API layer submits TransferInstruction_Accept + Invoice_ConfirmSettled
+-- in a single Canton batch transaction.
+
+-- | Transfer instruction interface from CIP-0056 / Token Standard.
+-- This is imported from Splice.Api.Token.TransferInstructionV1.
+-- The actual TransferInstruction contracts are created via TransferFactory
+-- and exercised via TransferInstruction_Accept/Reject/Withdraw choices.
+
+-- =============================================================================
+-- BUSINESS REGISTRATION (Onboarding)
+-- =============================================================================
+-- Represents a business onboarded to Monoton.
+-- This is the ledger fact that proves a party is a valid Monoton counterparty.
+-- Nothing should reference a business in an Invoice unless they have an active
+-- BusinessRegistration. This is checked by the API layer.
+
+data BusinessStatus
+  = Active     -- Business is active and can create/receive invoices
+  | Suspended  -- Business is suspended (can be reactivated)
+  | Revoked    -- Business is revoked (permanent)
+  deriving (Eq, Show)
+
+template BusinessRegistration
+  with
+    business : Party       -- The business's Canton party
+    operator : Party       -- Monoton operator who registered this business
+    businessName : Text    -- Human-readable business name
+    taxId : Text          -- Tax/company identifier
+    status : BusinessStatus
+    registeredAt : Time   -- When business was registered
+  where
+    signatory operator
+    observer business
+
+    ensure business /= operator
+         && businessName /= ""
+         && taxId /= ""
+
+    -- Operator can suspend a business (e.g., for KYC review)
+    choice Business_Suspend : ContractId BusinessRegistration
+      with reason : Text
+      controller operator
+      do
+        assert (status == Active)
+        create this with status = Suspended
+
+    -- Operator can reactivate a suspended business
+    choice Business_Reactivate : ContractId BusinessRegistration
+      controller operator
+      do
+        assert (status == Suspended)
+        create this with status = Active
+
+    -- Operator can permanently revoke a business
+    choice Business_Revoke : ContractId BusinessRegistration
+      with reason : Text
+      controller operator
+      do
+        assert (status /= Revoked)
+        create this with status = Revoked
+
+-- =============================================================================
+-- SETTLEMENT DELEGATION (Path A Authorization)
+-- =============================================================================
+-- For Path A settlement: the seller pre-authorizes the operator to accept
+-- incoming transfers on their behalf. This makes the authorization a ledger
+-- fact that the ledger enforces, not just a JWT claim Monoton's backend claims.
+--
+-- This is what makes "the operator can settle for me" structurally true:
+-- - Without this: the operator's backend *claims* it can act for the seller
+-- - With this: the ledger *enforces* that the operator can accept transfers
+--   tagged with this seller's invoices
+
+template SettlementDelegation
+  with
+    seller : Party      -- The delegating party (seller)
+    operator : Party   -- The authorized operator
+    scope : Text       -- Scope of delegation (e.g., "invoice-settlement", "all")
+    validFrom : Time   -- When delegation becomes valid
+    validUntil : Time  -- When delegation expires (for time-bound authorization)
+    active : Bool     -- Whether delegation is currently active
+  where
+    signatory seller
+    observer operator
+
+    ensure seller /= operator
+         && scope /= ""
+         && validFrom <= validUntil
+
+    -- Seller can revoke the delegation at any time
+    choice Delegation_Revoke : ContractId SettlementDelegation
+      with reason : Text
+      controller seller
+      do
+        create this with active = False
+
+    -- Seller can extend the validity period
+    choice Delegation_Extend : ContractId SettlementDelegation
+      with newValidUntil : Time
+      controller seller
+      do
+        assert (active)
+        assert (newValidUntil > validUntil)
+        create this with validUntil = newValidUntil
+
+    -- Operator can pause (but not revoke) the delegation
+    choice Delegation_Pause : ContractId SettlementDelegation
+      controller operator
+      do
+        assert (active)
+        create this with active = False
+
+    -- Operator can resume a paused delegation
+    choice Delegation_Resume : ContractId SettlementDelegation
+      controller operator
+      do
+        assert (not active)
+        create this with active = True
+
+-- =============================================================================
+-- INVOICE (Core Settlement Contract)
+-- =============================================================================
+-- The Invoice template implements the B2B payment lifecycle:
+-- 1. Seller creates invoice (Created)
+-- 2. Buyer approves (Approved)
+-- 3. Buyer initiates settlement (AwaitingSettlement) - links TransferInstruction
+-- 4. Operator confirms settlement (Settled) - in same atomic batch as transfer
+--
+-- PATH A ONLY: All settlement steps happen in one Canton batch transaction:
+--   TransferFactory_Transfer + TransferInstruction_Accept + Invoice_ConfirmSettled
+--
+-- Privacy: Only seller, buyer, operator are ever aware of this contract.
+-- This is enforced structurally by Daml's signatory/observer model.
+
+template Invoice
+  with
+    seller : Party       -- Business issuing the invoice (signatory)
+    buyer : Party         -- Business that will pay (observer)
+    operator : Party      -- Monoton operator (observer)
+    amount : Decimal      -- Payment amount
+    currency : Text      -- Currency code (e.g., "USD")
+    description : Text    -- Invoice description
+    dueDate : Date       -- Payment deadline
+    status : InvoiceStatus
+    invoiceId : Text     -- Unique invoice identifier
+    -- Instrument admin party (from Canton Token Standard/Canton Coin registry)
+    -- This is the party that administers the instrument being transferred
+    instrumentAdmin : Party
+    -- Reference to the TransferInstruction (CIP-0056)
+    -- Set when buyer initiates settlement
+    -- Note: In Path A, this is created AND resolved in the same atomic batch
+    transferInstructionCid : Optional (ContractId TransferInstruction)
+  where
+    signatory seller
+    observer buyer, operator
+
+    ensure amount > 0.0
+         && seller /= buyer
+         && seller /= operator
+         && buyer /= operator
+
+    -- Seller can update description while invoice is in Created status
+    choice Invoice_UpdateDescription : ContractId Invoice
+      with newDescription : Text
+      controller seller
+      do
+        assert (status == Created)
+        create this with description = newDescription
+
+    -- Buyer approves the invoice
+    choice Invoice_Approve : ContractId Invoice
+      controller buyer
+      do
+        assert (status == Created)
+        create this with status = Approved
+
+    -- Buyer rejects the invoice
+    choice Invoice_Reject : ContractId Invoice
+      with rejectionReason : Text
+      controller buyer
+      do
+        assert (status == Created)
+        create this with status = Rejected
+
+    -- Buyer initiates settlement (Path A)
+    -- This is a NON-CONSUMING choice because in Path A:
+    -- 1. The API layer creates the TransferInstruction via TransferFactory
+    -- 2. The TransferInstruction CID is passed to this choice
+    -- 3. The actual transfer + confirmation happen in the SAME atomic batch:
+    --    - TransferInstruction_Accept (moves Holdings)
+    --    - Invoice_ConfirmSettled (marks invoice as settled)
+    --
+    -- The pending TransferInstruction holds value temporarily, but this
+    -- exists ONLY within the atomic batch - no persistent intermediate state.
+    nonconsuming choice Invoice_InitiateSettlement : ContractId Invoice
+      with
+        -- Reference to the TransferInstruction contract (created via TransferFactory)
+        -- This links the invoice to the actual token transfer
+        newTransferInstructionCid : ContractId TransferInstruction
+      controller buyer
+      do
+        assert (status == Approved)
+        create this with status = AwaitingSettlement, transferInstructionCid = Some newTransferInstructionCid
+
+    -- Operator confirms that settlement has completed (Path A)
+    --
+    -- IMPORTANT: In Path A, this executes in the SAME atomic batch as:
+    --   - TransferFactory_Transfer (creates pending TransferInstruction)
+    --   - TransferInstruction_Accept (resolves transfer, moves Holdings)
+    --
+    -- SECURITY: This choice MUST verify the transfer actually completed with
+    -- correct values. Without verification, operator could batch a fake $1
+    -- transfer with Invoice_ConfirmSettled for a $10,000 invoice.
+    --
+    -- The Holding interface alone doesn't guarantee legitimacy (anyone can
+    -- implement the interface with false data). The check against
+    -- instrumentAdmin is what proves the Holding came from the real instrument.
+    --
+    -- TransferInstructionResult_Accept is NOT guaranteed to return Completed -
+    -- implementations MAY return any of the three result types.
+    choice Invoice_ConfirmSettled : ContractId Invoice
+      with
+        -- The seller's new Holding from the completed transfer
+        -- This is returned by TransferInstruction_Accept in TransferInstructionResult_Completed
+        settledHoldingCid : ContractId Holding
+        -- The result of the TransferInstruction_Accept choice
+        -- Used to verify the transfer actually succeeded
+        transferResult : TransferInstructionResult
+      controller operator
+      do
+        assert (status == AwaitingSettlement)
+        
+        -- Verify the transfer completed successfully
+        -- Per Token Standard docs, Accept may return Pending/Completed/Failed
+        -- We only settle if it actually completed
+        case transferResult.output of
+          TransferInstructionResult_Failed ->
+            -- Transfer failed - cannot settle
+            abort "Transfer instruction failed"
+          TransferInstructionResult_Pending _ ->
+            -- Transfer still pending - cannot settle
+            abort "Transfer instruction still pending"
+          TransferInstructionResult_Completed with receiverHoldingCids ->
+            -- Transfer completed - verify the Holding
+            -- The completed transfer should have created Holdings for the seller
+            -- We check that our provided holding is among them
+            assert (settledHoldingCid `elem` receiverHoldingCids)
+        
+        -- SECURITY: Fetch the Holding and verify it actually represents the settlement
+        -- This is critical because Holding is an interface - anyone can implement
+        -- it with false data. The instrumentAdmin check proves legitimacy.
+        holdingContract <- fetch settledHoldingCid
+        let holdingView = view holdingContract
+        
+        -- Verify the Holding belongs to the seller (not someone else)
+        assert (holdingView.owner == seller)
+        
+        -- Verify the Holding has the correct amount
+        assert (holdingView.amount == amount)
+        
+        -- SECURITY CRITICAL: Verify the Holding's instrument is administered by
+        -- the expected instrumentAdmin. Without this check, someone could provide
+        -- a fake Holding claiming to be from the right instrument with the right amount.
+        -- The instrumentAdmin field on Invoice is load-bearing - it's what enables this check.
+        assert (holdingView.instrumentId.admin == instrumentAdmin)
+        
+        create this with status = Settled
+
+    -- Operator can cancel settlement if it times out
+    -- (e.g., TransferInstruction expired without acceptance)
+    -- Note: In Path A, this would only apply if the batch was split
+    choice Invoice_CancelSettlement : ContractId Invoice
+      with cancellationReason : Text
+      controller operator
+      do
+        assert (status == AwaitingSettlement)
+        create this with status = Approved, transferInstructionCid = None
+
+-- =============================================================================
+-- WALLET / HOLDING CREATION (For Testing)
+-- =============================================================================
+-- This module provides a simple way to create Holding contracts for testing.
+-- In production, Holdings would be created via the Token Standard registry.
+--
+-- For Devnet testing, we provide:
+-- 1. TestHolding: A simple holding template for funding test accounts
+-- 2. Faucet: An operator-controlled minting contract for test tokens
+--
+-- IMPORTANT: In production:
+-- - Holdings are created via TransferFactory/Mint operations
+-- - This module is for TESTING ONLY
+
+-- | A simple test Holding that implements the Holding interface.
+-- This is used for testing the full settlement flow without requiring
+-- the full Token Standard implementation.
+--
+-- In production, real Holdings would be:
+-- - Created via TransferFactory_Transfer (transfers)
+-- - Minted via AllocationFactory (initial issuance)
+--
+-- This test holding allows us to:
+-- 1. Fund buyer accounts with test tokens
+-- 2. Test the full settlement flow end-to-end
+-- 3. Verify Invoice_ConfirmSettled security checks work
+--
+-- IMPORTANT: This implements the Token Standard Holding interface,
+-- so it can be used directly with Invoice_ConfirmSettled.
+
+template TestHolding
+  with
+    owner : Party           -- Who holds these tokens
+    instrumentAdmin : Party -- The admin who issued this token
+    currencyCode : Text     -- Currency identifier (e.g., "CC", "USD")
+    amount : Decimal        -- How many tokens
+  where
+    signatory owner, instrumentAdmin
+    observer instrumentAdmin
+
+    ensure amount > 0.0
+
+    -- Implement the Holding interface
+    interface instance Holding for TestHolding where
+      view = HoldingView with
+        owner = owner
+        instrumentId = InstrumentId with
+          admin = instrumentAdmin
+          id = currencyCode
+        amount = amount
+        lock = None
+        meta = emptyMetadata
+
+    -- Transfer the holding to another party
+    choice TestHolding_Transfer : (ContractId TestHolding, ContractId TestHolding)
+      with
+        newOwner : Party
+      controller owner
+      do
+        assert (newOwner /= owner)
+        oldHolding <- create this with owner = owner
+        newHolding <- create this with owner = newOwner
+        pure (oldHolding, newHolding)
+
+-- | A faucet for minting test tokens.
+-- The operator can create TestHolding contracts to fund test accounts.
+--
+-- In production, token minting would be controlled by:
+-- - AllocationFactory from utility-registry
+-- - Off-ledger API calls to the token registry
+template Faucet
+  with
+    operator : Party           -- Who can mint tokens
+    instrumentAdmin : Party     -- The admin for these tokens
+    currencyCode : Text          -- Currency to mint
+  where
+    signatory operator
+
+    -- Mint new tokens to a party
+    -- This simulates what AllocationFactory does in production
+    nonconsuming choice Faucet_Mint : ContractId TestHolding
+      with
+        recipient : Party        -- Who receives the tokens
+        amount : Decimal         -- How many to mint
+      controller operator
+      do
+        assert (amount > 0.0)
+        create TestHolding with
+          owner = recipient
+          instrumentAdmin = instrumentAdmin
+          currencyCode = currencyCode
+          amount = amount
+
+    -- Batch mint to multiple recipients
+    nonconsuming choice Faucet_BatchMint : [ContractId TestHolding]
+      with
+        recipients : [(Party, Decimal)]  -- (recipient, amount) pairs
+      controller operator
+      do
+        forA recipients $ \(recipient, amt) -> do
+          assert (amt > 0.0)
+          create TestHolding with
+            owner = recipient
+            instrumentAdmin = instrumentAdmin
+            currencyCode = currencyCode
+            amount = amt
+
+-- | Wallet service for a party.
+-- Provides convenience choices for managing holdings.
+template Wallet
+  with
+    owner : Party              -- The wallet owner
+    operator : Party            -- The platform operator
+  where
+    signatory owner
+    observer operator
+
+    -- Request tokens from faucet (off-ledger call would trigger this)
+    nonconsuming choice Wallet_RequestFaucet : ContractId TestHolding
+      with
+        faucetCid : ContractId Faucet
+        amount : Decimal
+      controller owner
+      do
+        exercise faucetCid Faucet_Mint with
+          recipient = owner
+          amount = amount

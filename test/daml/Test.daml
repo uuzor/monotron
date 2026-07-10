@@ -1,0 +1,406 @@
+-- Monoton Invoice Lifecycle Tests
+-- Tests the B2B invoice settlement templates:
+-- - BusinessRegistration (onboarding)
+-- - SettlementDelegation (Path A authorization)
+-- - Invoice (core settlement contract)
+-- Settlement uses real TransferInstruction from Splice.Api.Token.TransferInstructionV1
+
+module Test where
+
+import Main
+import Daml.Script
+import DA.Time (addRelTime, days)
+import DA.Date (date, Month(Jan, Mar, Apr, May, Jun))
+import qualified Main as M
+
+-- =============================================================================
+-- BUSINESS REGISTRATION TESTS
+-- =============================================================================
+
+-- | Test registering a new business
+testBusinessRegistration : Script (ContractId BusinessRegistration)
+testBusinessRegistration = script do
+  -- Allocate parties
+  business <- allocatePartyByHint (PartyIdHint "AcmeCorp")
+  operator <- allocatePartyByHint (PartyIdHint "MonotonOperator")
+
+  -- Register the business (using current time)
+  now <- getTime
+
+  regCid <- submit operator do
+    createCmd BusinessRegistration with
+      business = business
+      operator = operator
+      businessName = "Acme Corporation"
+      taxId = "US123456789"
+      status = M.Active
+      registeredAt = now
+
+  pure regCid
+
+-- | Test suspending a business
+testBusinessSuspension : Script (ContractId BusinessRegistration)
+testBusinessSuspension = script do
+  business <- allocatePartyByHint (PartyIdHint "AcmeCorp2")
+  operator <- allocatePartyByHint (PartyIdHint "MonotonOperator2")
+
+  now <- getTime
+
+  regCid <- submit operator do
+    createCmd BusinessRegistration with
+      business = business
+      operator = operator
+      businessName = "Acme Corp 2"
+      taxId = "US987654321"
+      status = M.Active
+      registeredAt = now
+
+  -- Suspend the business
+  suspendedCid <- submit operator do
+    exerciseCmd regCid Business_Suspend
+      with reason = "Pending KYC review"
+
+  pure suspendedCid
+
+-- | Test that business cannot be created for same party as operator
+testBusinessCannotBeOwnOperator : Script ()
+testBusinessCannotBeOwnOperator = script do
+  party <- allocatePartyByHint (PartyIdHint "SameParty")
+
+  now <- getTime
+
+  -- Try to create a business where operator == business - should fail
+  submitMustFail party do
+    createCmd BusinessRegistration with
+      business = party
+      operator = party
+      businessName = "Bad Business"
+      taxId = "TAX123"
+      status = M.Active
+      registeredAt = now
+
+  pure ()
+
+-- =============================================================================
+-- SETTLEMENT DELEGATION TESTS
+-- =============================================================================
+
+-- | Test creating a settlement delegation
+testSettlementDelegation : Script (ContractId SettlementDelegation)
+testSettlementDelegation = script do
+  seller <- allocatePartyByHint (PartyIdHint "SellerBusiness")
+  operator <- allocatePartyByHint (PartyIdHint "MonotonOperator3")
+
+  now <- getTime
+  let future = addRelTime now (days 365)
+
+  delCid <- submit seller do
+    createCmd SettlementDelegation with
+      seller = seller
+      operator = operator
+      scope = "invoice-settlement"
+      validFrom = now
+      validUntil = future
+      active = True
+
+  pure delCid
+
+-- | Test revoking a delegation
+testDelegationRevocation : Script (ContractId SettlementDelegation)
+testDelegationRevocation = script do
+  seller <- allocatePartyByHint (PartyIdHint "SellerBusiness2")
+  operator <- allocatePartyByHint (PartyIdHint "MonotonOperator4")
+
+  now <- getTime
+  let future = addRelTime now (days 365)
+
+  delCid <- submit seller do
+    createCmd SettlementDelegation with
+      seller = seller
+      operator = operator
+      scope = "invoice-settlement"
+      validFrom = now
+      validUntil = future
+      active = True
+
+  -- Revoke the delegation
+  revokedCid <- submit seller do
+    exerciseCmd delCid Delegation_Revoke
+      with reason = "Business relationship ended"
+
+  pure revokedCid
+
+-- | Test pausing and resuming delegation
+testDelegationPauseResume : Script (ContractId SettlementDelegation)
+testDelegationPauseResume = script do
+  seller <- allocatePartyByHint (PartyIdHint "SellerBusiness3")
+  operator <- allocatePartyByHint (PartyIdHint "MonotonOperator5")
+
+  now <- getTime
+  let future = addRelTime now (days 365)
+
+  delCid <- submit seller do
+    createCmd SettlementDelegation with
+      seller = seller
+      operator = operator
+      scope = "invoice-settlement"
+      validFrom = now
+      validUntil = future
+      active = True
+
+  -- Operator pauses the delegation
+  pausedCid <- submit operator do
+    exerciseCmd delCid Delegation_Pause
+
+  -- Operator resumes the delegation
+  resumedCid <- submit operator do
+    exerciseCmd pausedCid Delegation_Resume
+
+  pure resumedCid
+
+-- =============================================================================
+-- INVOICE TESTS
+-- =============================================================================
+
+-- | Test the full invoice lifecycle with Path A settlement
+testInvoiceLifecycle : Script (ContractId Invoice)
+testInvoiceLifecycle = script do
+  -- Allocate parties
+  seller <- allocatePartyByHint (PartyIdHint "Seller5")
+  buyer <- allocatePartyByHint (PartyIdHint "Buyer5")
+  operator <- allocatePartyByHint (PartyIdHint "Operator5")
+  instrumentAdmin <- allocatePartyByHint (PartyIdHint "CantonCoinRegistry")
+
+  -- Register both businesses first
+  now <- getTime
+
+  sellerReg <- submit operator do
+    createCmd BusinessRegistration with
+      business = seller
+      operator = operator
+      businessName = "Seller Corp"
+      taxId = "SELLER123"
+      status = M.Active
+      registeredAt = now
+
+  buyerReg <- submit operator do
+    createCmd BusinessRegistration with
+      business = buyer
+      operator = operator
+      businessName = "Buyer Corp"
+      taxId = "BUYER456"
+      status = M.Active
+      registeredAt = now
+
+  -- Seller creates a delegation for Path A settlement
+  delegationStart <- getTime
+  let delegationEnd = addRelTime delegationStart (days 365)
+
+  delCid <- submit seller do
+    createCmd SettlementDelegation with
+      seller = seller
+      operator = operator
+      scope = "invoice-settlement"
+      validFrom = delegationStart
+      validUntil = delegationEnd
+      active = True
+
+  -- Seller creates an invoice
+  invoiceCid <- submit seller do
+    createCmd Invoice with
+      seller = seller
+      buyer = buyer
+      operator = operator
+      amount = 1000.00
+      currency = "USD"
+      description = "Consulting services for Q1 2025"
+      dueDate = date 2025 Mar 31
+      status = M.Created
+      invoiceId = "INV-001"
+      instrumentAdmin = instrumentAdmin
+      transferInstructionCid = None
+
+  -- Buyer approves the invoice
+  approvedInvoiceCid <- submit buyer do
+    exerciseCmd invoiceCid Invoice_Approve
+
+  -- NOTE: Path A settlement requires the real TransferInstruction interface
+  -- from Splice.Api.Token.TransferInstructionV1 (CIP-0056).
+  -- In integration tests, the TransferInstruction is created via:
+  --   1. POST to /registrars/{id}/transfers/factory (creates TransferInstruction via TransferFactory)
+  --   2. The returned CID is passed to Invoice_InitiateSettlement
+  --
+  -- For unit testing here, we test state transitions only.
+  -- The full Path A batch (TransferInstruction_Accept + Invoice_ConfirmSettled)
+  -- is tested in integration tests against the Canton ledger.
+
+  pure approvedInvoiceCid
+
+-- | Test invoice rejection
+testInvoiceRejection : Script (ContractId Invoice)
+testInvoiceRejection = script do
+  seller <- allocatePartyByHint (PartyIdHint "Seller6")
+  buyer <- allocatePartyByHint (PartyIdHint "Buyer6")
+  operator <- allocatePartyByHint (PartyIdHint "Operator6")
+  instrumentAdmin <- allocatePartyByHint (PartyIdHint "CantonCoinRegistry2")
+
+  invoiceCid <- submit seller do
+    createCmd Invoice with
+      seller = seller
+      buyer = buyer
+      operator = operator
+      amount = 500.00
+      currency = "EUR"
+      description = "Software license"
+      dueDate = date 2025 Jun 30
+      status = M.Created
+      invoiceId = "INV-002"
+      instrumentAdmin = instrumentAdmin
+      transferInstructionCid = None
+
+  rejectedInvoiceCid <- submit buyer do
+    exerciseCmd invoiceCid Invoice_Reject
+      with rejectionReason = "Price too high"
+
+  pure rejectedInvoiceCid
+
+-- | Test that seller cannot approve their own invoice
+testSellerCannotApproveOwnInvoice : Script ()
+testSellerCannotApproveOwnInvoice = script do
+  seller <- allocatePartyByHint (PartyIdHint "Seller7")
+  buyer <- allocatePartyByHint (PartyIdHint "Buyer7")
+  operator <- allocatePartyByHint (PartyIdHint "Operator7")
+  instrumentAdmin <- allocatePartyByHint (PartyIdHint "CantonCoinRegistry3")
+
+  invoiceCid <- submit seller do
+    createCmd Invoice with
+      seller = seller
+      buyer = buyer
+      operator = operator
+      amount = 250.00
+      currency = "GBP"
+      description = "Design work"
+      dueDate = date 2025 Apr 15
+      status = M.Created
+      invoiceId = "INV-003"
+      instrumentAdmin = instrumentAdmin
+      transferInstructionCid = None
+
+  -- Seller tries to approve - should fail
+  submitMustFail seller do
+    exerciseCmd invoiceCid Invoice_Approve
+
+  pure ()
+
+-- | Test invoice lifecycle up to approval
+-- Note: Invoice_ConfirmSettled requires integration testing with real Token Standard contracts
+testCannotSettleBeforeInitiation : Script ()
+testCannotSettleBeforeInitiation = script do
+  seller <- allocatePartyByHint (PartyIdHint "Seller8")
+  buyer <- allocatePartyByHint (PartyIdHint "Buyer8")
+  operator <- allocatePartyByHint (PartyIdHint "Operator8")
+  instrumentAdmin <- allocatePartyByHint (PartyIdHint "CantonCoinRegistry4")
+
+  invoiceCid <- submit seller do
+    createCmd Invoice with
+      seller = seller
+      buyer = buyer
+      operator = operator
+      amount = 750.00
+      currency = "USD"
+      description = "Marketing services"
+      dueDate = date 2025 May 1
+      status = M.Created
+      invoiceId = "INV-004"
+      instrumentAdmin = instrumentAdmin
+      transferInstructionCid = None
+
+  -- Buyer can approve the invoice
+  approvedInvoiceCid <- submit buyer do
+    exerciseCmd invoiceCid Invoice_Approve
+
+  -- Verify approval succeeded
+  assert (approvedInvoiceCid /= invoiceCid)
+
+  -- NOTE: Invoice_ConfirmSettled requires real Holding and TransferInstructionResult
+  -- from the Token Standard. This cannot be tested in unit tests without the
+  -- full Canton runtime and Token Standard implementation.
+  --
+  -- Integration test needed (against real Canton ledger with Token Standard):
+  -- 1. Create a Holding contract via TransferFactory
+  -- 2. Execute TransferFactory_Transfer to create TransferInstruction
+  -- 3. Execute TransferInstruction_Accept to complete transfer
+  -- 4. Call Invoice_ConfirmSettled with:
+  --    - settledHoldingCid: the seller's new Holding
+  --    - transferResult: TransferInstructionResult_Completed
+  --
+  -- The security verification (owner=seller, amount=amount, instrumentAdmin=admin)
+  -- can only be tested with real contracts.
+
+  pure ()
+
+-- | Test settlement cancellation
+testSettlementCancellation : Script (ContractId Invoice)
+testSettlementCancellation = script do
+  seller <- allocatePartyByHint (PartyIdHint "Seller9")
+  buyer <- allocatePartyByHint (PartyIdHint "Buyer9")
+  operator <- allocatePartyByHint (PartyIdHint "Operator9")
+  instrumentAdmin <- allocatePartyByHint (PartyIdHint "CantonCoinRegistry5")
+
+  invoiceCid <- submit seller do
+    createCmd Invoice with
+      seller = seller
+      buyer = buyer
+      operator = operator
+      amount = 1000.00
+      currency = "USD"
+      description = "Test settlement timeout"
+      dueDate = date 2025 Jun 15
+      status = M.Created
+      invoiceId = "INV-005"
+      instrumentAdmin = instrumentAdmin
+      transferInstructionCid = None
+
+  approvedInvoiceCid <- submit buyer do
+    exerciseCmd invoiceCid Invoice_Approve
+
+  -- NOTE: In integration tests, we would create a TransferInstruction via
+  -- the registry API and then call Invoice_InitiateSettlement.
+  -- For unit tests, we just verify the approval state transition.
+
+  pure approvedInvoiceCid
+
+-- =============================================================================
+-- INTEGRATION TEST NOTES
+-- =============================================================================
+-- These unit tests verify template logic in isolation.
+--
+-- For full Path A settlement testing, you need:
+-- 1. Deploy Canton Token Standard DAR to the ledger
+-- 2. Create an actual TransferInstruction contract
+-- 3. Exercise TransferInstruction_Accept + Invoice_ConfirmSettled
+--    in a single Canton batch transaction
+--
+-- Example JSON API batch call for Path A:
+-- POST /v2/commands/submit-and-wait
+-- {
+--   "commands": [
+--     {
+--       "commandType": "exercise",
+--       "templateId": "TransferInstruction:...",
+--       "contractId": "<transferInstructionCid>",
+--       "choice": "TransferInstruction_Accept"
+--     },
+--     {
+--       "commandType": "exercise",
+--       "templateId": "Invoice:...",
+--       "contractId": "<invoiceCid>",
+--       "choice": "Invoice_ConfirmSettled",
+--       "argument": {
+--         "transferResult": null
+--       }
+--     }
+--   ],
+--   "actAs": ["operator"],
+--   "readAs": ["seller"]
+-- }

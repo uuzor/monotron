@@ -1,0 +1,15 @@
+name: monotron-main
+source: daml
+version: 0.0.1
+dependencies:
+  - daml-prim
+  - daml-stdlib
+data-dependencies:
+  # Splice API interfaces (CIP-0056 Token Standard)
+  - lib/splice-api-token-transfer-instruction-v1-1.0.0.dar
+  - lib/splice-api-token-metadata-v1-1.0.0.dar
+  - lib/splice-api-token-holding-v1-1.0.0.dar
+  # Utility Registry packages
+  - lib/utility-registry-v0-0.6.0.dar
+  - lib/utility-registry-holding-v0-0.2.1.dar
+  - lib/utility-registry-app-v0-0.7.0.dar
