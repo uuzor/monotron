@@ -2,8 +2,13 @@
 """
 Monotron Devnet Integration Test
 Connects to Canton Devnet and runs the invoice settlement flow
+
+Usage:
+    export DEVNET_CLIENT_SECRET="your-secret"
+    python3 scripts/devnet-test.py
 """
 import json
+import os
 import requests
 import time
 from datetime import datetime
@@ -12,7 +17,12 @@ from datetime import datetime
 DEVNET_HOST = "ledger-api.validator.devnet.sandbox.fivenorth.io"
 DEVNET_AUTH = "https://auth.sandbox.fivenorth.io"
 CLIENT_ID = "validator-devnet-m2m"
-CLIENT_SECRET = "r69FQmevLRwEgMB8NnKaSDHPewTOSx7Yy5jucsqAlmsAaJc3DlggedCz4tyyonl4W2WoOVzkUIjy8dHTlc16AOJQzx02QzJylAUG56oLTCoVCJUUK40vRv9CqQEY3fjn"
+CLIENT_SECRET = os.environ.get("DEVNET_CLIENT_SECRET", "")
+
+if not CLIENT_SECRET:
+    print("[ERROR] DEVNET_CLIENT_SECRET environment variable not set!")
+    print("Run: export DEVNET_CLIENT_SECRET='your-secret'")
+    exit(1)
 
 def get_token():
     """Get JWT access token from Devnet auth service"""

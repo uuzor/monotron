@@ -2,6 +2,10 @@
 /**
  * Monotron Devnet WebSocket Client
  * Connects to Canton Devnet via WebSocket for command submission
+ * 
+ * Usage:
+ *   export DEVNET_CLIENT_SECRET="your-secret"
+ *   node scripts/devnet-ws-test.js
  */
 const WebSocket = require('ws');
 const https = require('https');
@@ -11,11 +15,18 @@ const http = require('http');
 const LEDGER_HOST = "ledger-api.validator.devnet.sandbox.fivenorth.io";
 const AUTH_URL = "https://auth.sandbox.fivenorth.io";
 const CLIENT_ID = "validator-devnet-m2m";
-const CLIENT_SECRET = "r69FQmevLRwEgMB8NnKaSDHPewTOSx7Yy5jucsqAlmsAaJc3DlggedCz4tyyonl4W2WoOVzkUIjy8dHTlc16AOJQzx02QzJylAUG56oLTCoVCJUUK40vRv9CqQEY3fjn";
+const CLIENT_SECRET = process.env.DEVNET_CLIENT_SECRET;
+
+if (!CLIENT_SECRET) {
+    console.error("[ERROR] DEVNET_CLIENT_SECRET environment variable not set!");
+    console.error("Run: export DEVNET_CLIENT_SECRET='your-secret'");
+    process.exit(1);
+}
+
 const AUDIENCE = "validator-devnet-m2m";
 
-// Monotron Package ID
-const PKG_ID = "97272681dcc9d7a530739f9a31a77a37cfd87f09b7b7a5ac63519bebd457416c";
+// Monotron Package ID (set via environment or use default)
+const PKG_ID = process.env.DEVNET_PACKAGE_ID || "";
 
 // Get JWT Token
 async function getToken() {
