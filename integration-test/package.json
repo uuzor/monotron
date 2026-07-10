@@ -1,0 +1,18 @@
+{
+  "name": "@monoton/integration-test",
+  "version": "0.1.0",
+  "description": "Monoton E2E Integration Tests with Playwright",
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:ui": "playwright test --ui"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "@types/node": "^22.19.17"
+  }
+}
